@@ -5,6 +5,8 @@ Voice/LLM comes later; that layer should POST/PUT here after the caller confirms
 
 from __future__ import annotations
 
+import hmac
+import json
 import logging
 import os
 import re
@@ -13,10 +15,10 @@ from datetime import date, datetime, timezone
 from typing import Annotated, Optional
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, BeforeValidator, field_validator
+from pydantic import BaseModel, ConfigDict, BeforeValidator, ValidationError, field_validator
 from sqlalchemy import Column, Date, DateTime, String, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
@@ -25,7 +27,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("carecloud")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./patients.db")
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+VAPI_WEBHOOK_SECRET = os.getenv("VAPI_WEBHOOK_SECRET", "")
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -450,6 +454,11 @@ async def unhandled(_req, exc: Exception):
     return fail(500, "An unexpected error occurred")
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 @app.get("/patients")
 def list_patients(
     last_name: Optional[str] = Query(None),
@@ -481,18 +490,16 @@ def _to_row(data: dict) -> dict:
     return data
 
 
-@app.post("/patients")
-def create_patient(payload: PatientIn, db: Session = Depends(get_db)):
+def persist_new_patient(db: Session, payload: PatientIn) -> Patient:
     p = Patient(**_to_row(payload.model_dump()))
     db.add(p)
     db.commit()
     db.refresh(p)
     log.info("patient.created %s", as_dict(p))
-    return ok(as_dict(p), 201)
+    return p
 
 
-@app.put("/patients/{patient_id}", summary="Update a patient (partial)")
-def update_patient(patient_id: str, payload: PatientUpdate, db: Session = Depends(get_db)):
+def persist_update(db: Session, patient_id: str, payload: PatientUpdate) -> Patient:
     p = active(db, patient_id)
     for k, v in _to_row(payload.model_dump(exclude_unset=True)).items():
         setattr(p, k, v)
@@ -500,6 +507,103 @@ def update_patient(patient_id: str, payload: PatientUpdate, db: Session = Depend
     db.commit()
     db.refresh(p)
     log.info("patient.updated %s", as_dict(p))
+    return p
+
+
+def find_by_phone(db: Session, phone_number: str) -> Patient | None:
+    return (
+        db.query(Patient)
+        .filter(Patient.phone_number == check_phone(phone_number), Patient.deleted_at.is_(None))
+        .first()
+    )
+
+
+def _validation_text(exc: ValidationError) -> str:
+    parts = []
+    for err in exc.errors():
+        field = ".".join(str(x) for x in err.get("loc", ()) if x != "body")
+        msg = err.get("msg", "Invalid value").removeprefix("Value error, ")
+        parts.append(f"{field}: {msg}" if field else msg)
+    return "; ".join(parts) or "Validation failed"
+
+
+def _tool_calls(message: dict) -> list[dict]:
+    raw = message.get("toolCallList") or message.get("toolCalls") or []
+    if not raw:
+        for item in message.get("toolWithToolCallList") or []:
+            tc = item.get("toolCall") or {}
+            fn = tc.get("function") or {}
+            raw.append({
+                "id": tc.get("id"),
+                "name": item.get("name") or fn.get("name"),
+                "parameters": tc.get("parameters") or fn.get("parameters") or fn.get("arguments"),
+            })
+    out = []
+    for call in raw:
+        fn = call.get("function") or {}
+        args = call.get("parameters") or call.get("arguments") or fn.get("arguments") or fn.get("parameters") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        out.append({
+            "id": call.get("id"),
+            "name": call.get("name") or fn.get("name"),
+            "args": args if isinstance(args, dict) else {},
+        })
+    return out
+
+
+def _vapi_authorized(authorization: str | None, x_vapi_secret: str | None) -> bool:
+    if not VAPI_WEBHOOK_SECRET:
+        return True
+    token = ""
+    if authorization:
+        token = authorization[7:] if authorization.lower().startswith("bearer ") else authorization
+    elif x_vapi_secret:
+        token = x_vapi_secret
+    return hmac.compare_digest(token, VAPI_WEBHOOK_SECRET)
+
+
+def run_vapi_tool(db: Session, name: str | None, args: dict) -> str:
+    if name == "lookup_patient":
+        found = find_by_phone(db, args.get("phone_number") or "")
+        if not found:
+            return "No existing patient with that phone number. Continue registration, then call register_patient after the caller confirms."
+        return (
+            f"Existing patient found: {found.first_name} {found.last_name}, "
+            f"patient_id {found.patient_id}. Ask if they want to update that record "
+            "instead of creating a new one."
+        )
+
+    if name == "register_patient":
+        p = persist_new_patient(db, PatientIn(**args))
+        return (
+            f"Successfully registered {p.first_name} {p.last_name}. "
+            f"patient_id {p.patient_id}. Tell them they are all set, then end the call."
+        )
+
+    if name == "update_patient":
+        patient_id = args.get("patient_id")
+        if not patient_id:
+            raise ValueError("patient_id is required to update a record")
+        payload = PatientUpdate(**{k: v for k, v in args.items() if k != "patient_id"})
+        p = persist_update(db, str(patient_id), payload)
+        return f"Updated {p.first_name} {p.last_name}. Tell them the record is saved, then end the call."
+
+    raise ValueError(f"Unknown tool: {name}")
+
+
+@app.post("/patients")
+def create_patient(payload: PatientIn, db: Session = Depends(get_db)):
+    p = persist_new_patient(db, payload)
+    return ok(as_dict(p), 201)
+
+
+@app.put("/patients/{patient_id}", summary="Update a patient (partial)")
+def update_patient(patient_id: str, payload: PatientUpdate, db: Session = Depends(get_db)):
+    p = persist_update(db, patient_id, payload)
     return ok(as_dict(p))
 
 
@@ -513,3 +617,50 @@ def delete_patient(patient_id: str, db: Session = Depends(get_db)):
     db.refresh(p)
     log.info("patient.soft_deleted %s", as_dict(p))
     return ok(as_dict(p))
+
+
+@app.post("/vapi-webhook")
+async def vapi_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+    authorization: str | None = Header(default=None),
+    x_vapi_secret: str | None = Header(default=None, alias="X-Vapi-Secret"),
+):
+    """Vapi Server URL. Always 200 on tool-calls so the agent can speak errors."""
+    if not _vapi_authorized(authorization, x_vapi_secret):
+        raise HTTPException(401, "Unauthorized")
+
+    body = await request.json()
+    message = body.get("message") or {}
+    msg_type = message.get("type")
+
+    if msg_type == "end-of-call-report":
+        artifact = message.get("artifact") or {}
+        log.info(
+            "vapi.call_ended reason=%s transcript=%s",
+            message.get("endedReason"),
+            artifact.get("transcript"),
+        )
+        return {"status": "ok"}
+
+    if msg_type != "tool-calls":
+        return {"status": "ignored"}
+
+    results = []
+    for call in _tool_calls(message):
+        call_id = call["id"]
+        try:
+            text = run_vapi_tool(db, call["name"], call["args"])
+            results.append({"toolCallId": call_id, "result": text})
+        except ValidationError as exc:
+            db.rollback()
+            log.warning("vapi.validation %s", _validation_text(exc))
+            results.append({"toolCallId": call_id, "error": _validation_text(exc)})
+        except HTTPException as exc:
+            db.rollback()
+            results.append({"toolCallId": call_id, "error": str(exc.detail)})
+        except Exception as exc:
+            db.rollback()
+            log.exception("vapi.tool_error")
+            results.append({"toolCallId": call_id, "error": str(exc).replace("\n", " ")})
+    return {"results": results}
