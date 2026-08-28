@@ -309,6 +309,10 @@ class PatientIn(Rules):
 
 
 class PatientUpdate(Rules):
+    """Send only fields to change. Omitted fields stay as they are."""
+
+    model_config = ConfigDict(json_schema_extra={"example": {"first_name": "Jean"}})
+
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     date_of_birth: Optional[str] = None
@@ -487,7 +491,7 @@ def create_patient(payload: PatientIn, db: Session = Depends(get_db)):
     return ok(as_dict(p), 201)
 
 
-@app.put("/patients/{patient_id}")
+@app.put("/patients/{patient_id}", summary="Update a patient (partial)")
 def update_patient(patient_id: str, payload: PatientUpdate, db: Session = Depends(get_db)):
     p = active(db, patient_id)
     for k, v in _to_row(payload.model_dump(exclude_unset=True)).items():
