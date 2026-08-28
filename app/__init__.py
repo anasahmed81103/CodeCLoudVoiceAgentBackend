@@ -1,1 +1,0 @@
-"""CareCloud patient registration API."""
