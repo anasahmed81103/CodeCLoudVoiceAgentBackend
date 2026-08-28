@@ -10,13 +10,13 @@ import os
 import re
 import uuid
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import Annotated, Optional
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, BeforeValidator, field_validator
 from sqlalchemy import Column, Date, DateTime, String, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
@@ -125,12 +125,33 @@ def check_sex(v):
 
 
 def check_phone(v, field="phone_number"):
+    # Swagger often sends all-digit values as JSON numbers, not strings.
+    if isinstance(v, bool):
+        raise ValueError(f"{field} must be a valid U.S. 10-digit phone number")
+    if isinstance(v, float):
+        v = str(int(v))
+    elif isinstance(v, int):
+        v = str(v)
     digits = re.sub(r"\D", "", str(v))
     if len(digits) == 11 and digits.startswith("1"):
         digits = digits[1:]
-    if len(digits) != 10 or digits[0] in "01" or digits[3] in "01":
+    if len(digits) != 10:
         raise ValueError(f"{field} must be a valid U.S. 10-digit phone number")
     return digits
+
+
+def _opt_phone(v, field="phone_number"):
+    if v is None or v == "":
+        return None
+    return check_phone(v, field)
+
+
+Phone = Annotated[str, BeforeValidator(lambda v: check_phone(v))]
+OptPhone = Annotated[Optional[str], BeforeValidator(lambda v: _opt_phone(v))]
+OptEmergencyPhone = Annotated[
+    Optional[str],
+    BeforeValidator(lambda v: _opt_phone(v, "emergency_contact_phone")),
+]
 
 
 def check_state(v):
@@ -184,17 +205,15 @@ class Rules(BaseModel):
     @field_validator("date_of_birth", mode="before", check_fields=False)
     @classmethod
     def v_dob(cls, v):
-        return None if v is None else check_dob(v)
+        # Store MM/DD/YYYY in the schema so Swagger does not use a YYYY-MM-DD picker.
+        if v is None:
+            return None
+        return check_dob(v).strftime("%m/%d/%Y")
 
     @field_validator("sex", check_fields=False)
     @classmethod
     def v_sex(cls, v):
         return None if v is None else check_sex(v)
-
-    @field_validator("phone_number", check_fields=False)
-    @classmethod
-    def v_phone(cls, v):
-        return None if v is None else check_phone(v)
 
     @field_validator("email", check_fields=False)
     @classmethod
@@ -251,18 +270,31 @@ class Rules(BaseModel):
     def v_ecn(cls, v):
         return None if not blank(v) else check_name(v, "emergency_contact_name", 100)
 
-    @field_validator("emergency_contact_phone", check_fields=False)
-    @classmethod
-    def v_ecp(cls, v):
-        return None if not blank(v) else check_phone(v, "emergency_contact_phone")
-
 
 class PatientIn(Rules):
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "first_name": "Jane",
+        "last_name": "Doe",
+        "date_of_birth": "05/14/1992",
+        "sex": "Female",
+        "phone_number": "5551234567",
+        "email": "jane.doe@example.com",
+        "address_line_1": "123 Main St",
+        "city": "New York",
+        "state": "NY",
+        "zip_code": "10001",
+        "insurance_provider": "Blue Cross",
+        "insurance_member_id": "BC123456",
+        "preferred_language": "English",
+        "emergency_contact_name": "John Doe",
+        "emergency_contact_phone": "5559876543",
+    }})
+
     first_name: str
     last_name: str
-    date_of_birth: date
+    date_of_birth: str
     sex: str
-    phone_number: str
+    phone_number: Phone
     email: Optional[str] = None
     address_line_1: str
     address_line_2: Optional[str] = None
@@ -273,15 +305,15 @@ class PatientIn(Rules):
     insurance_member_id: Optional[str] = None
     preferred_language: Optional[str] = "English"
     emergency_contact_name: Optional[str] = None
-    emergency_contact_phone: Optional[str] = None
+    emergency_contact_phone: OptEmergencyPhone = None
 
 
 class PatientUpdate(Rules):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
-    date_of_birth: Optional[date] = None
+    date_of_birth: Optional[str] = None
     sex: Optional[str] = None
-    phone_number: Optional[str] = None
+    phone_number: OptPhone = None
     email: Optional[str] = None
     address_line_1: Optional[str] = None
     address_line_2: Optional[str] = None
@@ -292,7 +324,7 @@ class PatientUpdate(Rules):
     insurance_member_id: Optional[str] = None
     preferred_language: Optional[str] = None
     emergency_contact_name: Optional[str] = None
-    emergency_contact_phone: Optional[str] = None
+    emergency_contact_phone: OptEmergencyPhone = None
 
 
 def iso(dt: datetime | None) -> str | None:
@@ -439,9 +471,15 @@ def get_patient(patient_id: str, db: Session = Depends(get_db)):
     return ok(as_dict(active(db, patient_id)))
 
 
+def _to_row(data: dict) -> dict:
+    if "date_of_birth" in data and data["date_of_birth"] is not None:
+        data["date_of_birth"] = check_dob(data["date_of_birth"])
+    return data
+
+
 @app.post("/patients")
 def create_patient(payload: PatientIn, db: Session = Depends(get_db)):
-    p = Patient(**payload.model_dump())
+    p = Patient(**_to_row(payload.model_dump()))
     db.add(p)
     db.commit()
     db.refresh(p)
@@ -452,7 +490,7 @@ def create_patient(payload: PatientIn, db: Session = Depends(get_db)):
 @app.put("/patients/{patient_id}")
 def update_patient(patient_id: str, payload: PatientUpdate, db: Session = Depends(get_db)):
     p = active(db, patient_id)
-    for k, v in payload.model_dump(exclude_unset=True).items():
+    for k, v in _to_row(payload.model_dump(exclude_unset=True)).items():
         setattr(p, k, v)
     p.updated_at = utcnow()
     db.commit()
