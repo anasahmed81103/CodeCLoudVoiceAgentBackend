@@ -45,7 +45,9 @@ uvicorn main:app --host 0.0.0.0 --port $PORT
 DATABASE_URL=sqlite:////data/patients.db
 ```
 
-Otherwise use Render Postgres and paste its internal URL into `DATABASE_URL` (add `psycopg2-binary` to `requirements.txt` if you go that route). Without one of those, Call 2 will not see Call 1.
+Otherwise use Render Postgres and set `DATABASE_URL` to the internal URL (`postgres://` is rewritten to `postgresql://` automatically). `psycopg2-binary` is already in `requirements.txt`. Without a disk or Postgres, Call 2 will not see Call 1.
+
+Python version is pinned in `.python-version` (3.12). Don't let Render default to 3.14.
 
 Health check path: `/health`
 
